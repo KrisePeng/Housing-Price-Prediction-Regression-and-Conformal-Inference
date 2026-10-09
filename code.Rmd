@@ -1,0 +1,522 @@
+---
+title: "Project403"
+author: "Yan Peng"
+date: "2025-06-05"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+dir.create("figures", showWarnings = FALSE)
+```
+
+## 2. Regressio task
+
+### 2.1 Variable Selection and Transformation
+
+```{r libraries}
+library(tidyverse)
+library(boot)
+library(glmnet)
+library(broom)
+```
+
+```{r data-import}
+train <- read.table("./data/403_train.dat", header = TRUE)
+test1 <- read.table("./data/403_test-1.dat", header = TRUE)
+test2 <- read.table("./data/403_test-2.dat", header = TRUE)
+
+selected_vars <- train[, c(
+  "log10price", "sqft_living", "bathrooms",
+  "yr_built", "grade", "condition", "sqft_lot15"
+)]
+```
+
+```{r original-distributions, fig.width=10, fig.height=6}
+par(mfrow = c(2, 3), mar = c(4, 4, 2, 1))
+
+hist(train$sqft_living, main = "Living Area", xlab = "sqft_living")
+hist(train$yr_built, main = "Year Built", xlab = "yr_built")
+hist(train$grade, main = "Grade", xlab = "grade")
+hist(train$condition, main = "Condition", xlab = "condition")
+hist(train$bathrooms, main = "Bathrooms", xlab = "bathrooms")
+hist(train$sqft_lot15, main = "Nearby Lot Area", xlab = "sqft_lot15")
+
+dev.copy(
+  pdf,
+  file = "figures/check_skewness.pdf",
+  width = 10,
+  height = 6
+)
+dev.off()
+
+par(mfrow = c(1, 1))
+```
+
+```{r transformations, fig.width=9, fig.height=6}
+train <- train %>%
+  mutate(
+    log_sqft_living = log1p(sqft_living),
+    log_sqft_lot15 = log1p(sqft_lot15),
+    sqrt_bathrooms = sqrt(bathrooms),
+    yr_built_c = yr_built - mean(yr_built)
+  )
+
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+
+hist(train$log_sqft_living,
+     main = "Log Living Area",
+     xlab = "log_sqft_living")
+
+hist(train$log_sqft_lot15,
+     main = "Log Nearby Lot Area",
+     xlab = "log_sqft_lot15")
+
+hist(train$sqrt_bathrooms,
+     main = "Square Root Bathrooms",
+     xlab = "sqrt_bathrooms")
+
+hist(train$yr_built_c,
+     main = "Centered Year Built",
+     xlab = "yr_built_c")
+
+dev.copy(
+  pdf,
+  file = "figures/transition_regression.pdf",
+  width = 9,
+  height = 6
+)
+dev.off()
+
+par(mfrow = c(1, 1))
+```
+
+### 2.2 Final Model Specification
+
+```{r final-model}
+final_formula <- log10price ~ log_sqft_living +
+  sqrt_bathrooms + yr_built_c + grade +
+  condition + log_sqft_lot15
+
+model_final <- lm(final_formula, data = train)
+
+summary(model_final)
+```
+
+### 2.3 Model Performance and Interpretation
+
+```{r model-performance}
+pred_final <- predict(model_final, newdata = train)
+
+mse_final <- mean((train$log10price - pred_final)^2)
+
+cat("OLS training MSE:", mse_final, "\n")
+
+cat(
+  "Adjusted R-squared:",
+  summary(model_final)$adj.r.squared,
+  "\n"
+)
+
+beta_grade <- coef(model_final)["grade"]
+beta_living <- coef(model_final)["log_sqft_living"]
+
+cat(
+  "Price change for +1 grade (%):",
+  100 * (10^beta_grade - 1),
+  "\n"
+)
+
+cat(
+  "Approximate price change for +1% living area (%):",
+  100 * (10^(beta_living * log(1.01)) - 1),
+  "\n"
+)
+```
+
+### 2.4 Confidence Interval Construction
+
+```{r confidence-intervals}
+boot_fn <- function(data, indices) {
+  d <- data[indices, , drop = FALSE]
+  coef(lm(final_formula, data = d))
+}
+
+set.seed(123)
+
+boot_out <- boot(
+  data = train,
+  statistic = boot_fn,
+  R = 1000
+)
+
+boot_cis <- lapply(
+  seq_along(coef(model_final)),
+  function(i) {
+    boot.ci(boot_out, type = "perc", index = i)
+  }
+)
+
+names(boot_cis) <- names(coef(model_final))
+
+gaussian_ci <- confint(model_final) %>%
+  as.data.frame() %>%
+  rownames_to_column("term") %>%
+  rename(
+    gauss_lower = `2.5 %`,
+    gauss_upper = `97.5 %`
+  )
+
+boot_ci <- tibble(
+  term = names(boot_cis),
+  boot_lower = map_dbl(boot_cis, ~ .x$percent[4]),
+  boot_upper = map_dbl(boot_cis, ~ .x$percent[5])
+)
+
+combined_ci <- left_join(
+  gaussian_ci,
+  boot_ci,
+  by = "term"
+)
+
+combined_ci
+```
+
+```{r confidence-interval-plot, fig.width=9, fig.height=6}
+estimates <- tidy(model_final)[, c("term", "estimate")]
+
+ci_df <- estimates %>%
+  left_join(gaussian_ci, by = "term") %>%
+  left_join(boot_ci, by = "term") %>%
+  filter(term != "(Intercept)")
+
+ci_long <- ci_df %>%
+  pivot_longer(
+    cols = c(
+      gauss_lower,
+      gauss_upper,
+      boot_lower,
+      boot_upper
+    ),
+    names_to = c("type", ".value"),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    type = dplyr::recode(
+      type,
+      gauss = "Gaussian",
+      boot = "Bootstrap"
+    )
+  )
+
+ci_plot <- ggplot(
+  ci_long,
+  aes(x = term, y = estimate, color = type)
+) +
+  geom_pointrange(
+    aes(ymin = lower, ymax = upper),
+    position = position_dodge(width = 0.6),
+    linewidth = 0.7
+  ) +
+  labs(
+    title = "95% Confidence Intervals: Gaussian vs Bootstrap",
+    x = "Predictor",
+    y = "Coefficient Estimate",
+    color = "CI Type"
+  ) +
+  coord_flip() +
+  theme_minimal()
+
+print(ci_plot)
+
+ggsave(
+  filename = "figures/CI_Plot.pdf",
+  plot = ci_plot,
+  width = 9,
+  height = 6
+)
+```
+
+### 2.5 Assumption Diagnostics
+
+```{r diagnostics, fig.width=10, fig.height=5}
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+plot(
+  fitted(model_final),
+  resid(model_final),
+  xlab = "Fitted Values",
+  ylab = "Residuals",
+  main = "Residuals vs Fitted"
+)
+
+abline(h = 0, lty = 2)
+
+qqnorm(
+  resid(model_final),
+  main = "Normal Q-Q Plot"
+)
+
+qqline(resid(model_final))
+
+dev.copy(
+  pdf,
+  file = "figures/Assumption.pdf",
+  width = 10,
+  height = 5
+)
+dev.off()
+
+par(mfrow = c(1, 1))
+```
+
+### 2.6 Comparison with Penalized Models
+
+```{r penalized-models}
+X <- model.matrix(
+  final_formula,
+  data = train
+)[, -1, drop = FALSE]
+
+y <- train$log10price
+
+set.seed(123)
+
+foldid <- sample(
+  rep(seq_len(10), length.out = nrow(X))
+)
+
+cv_lasso <- cv.glmnet(
+  X,
+  y,
+  alpha = 1,
+  foldid = foldid
+)
+
+pred_lasso <- as.numeric(
+  predict(
+    cv_lasso,
+    newx = X,
+    s = "lambda.min"
+  )
+)
+
+mse_lasso <- mean((y - pred_lasso)^2)
+
+cv_ridge <- cv.glmnet(
+  X,
+  y,
+  alpha = 0,
+  foldid = foldid
+)
+
+pred_ridge <- as.numeric(
+  predict(
+    cv_ridge,
+    newx = X,
+    s = "lambda.min"
+  )
+)
+
+mse_ridge <- mean((y - pred_ridge)^2)
+
+mse_df <- tibble(
+  Model = c("OLS", "Lasso", "Ridge"),
+  Training_MSE = c(
+    mse_final,
+    mse_lasso,
+    mse_ridge
+  )
+)
+
+print(mse_df)
+```
+
+## 3 Jackknife+ Implementation with alpha = 0.05
+
+```{r jackknife-distributions, fig.width=12, fig.height=6}
+par(mfrow = c(2, 4), mar = c(4, 3, 2, 1))
+
+hist(train$sqft_living,
+     main = "Living Area", xlab = "sqft_living")
+
+hist(train$sqft_basement,
+     main = "Basement", xlab = "sqft_basement")
+
+hist(train$bathrooms,
+     main = "Bathrooms", xlab = "bathrooms")
+
+hist(train$sqft_lot,
+     main = "Lot Area", xlab = "sqft_lot")
+
+hist(log1p(train$sqft_living),
+     main = "Log Living Area", xlab = "log1p(sqft_living)")
+
+hist(log1p(train$sqft_basement),
+     main = "Log Basement", xlab = "log1p(sqft_basement)")
+
+hist(sqrt(train$bathrooms),
+     main = "Sqrt Bathrooms", xlab = "sqrt(bathrooms)")
+
+hist(log1p(train$sqft_lot),
+     main = "Log Lot Area", xlab = "log1p(sqft_lot)")
+
+dev.copy(
+  pdf,
+  file = "figures/skewness.pdf",
+  width = 12,
+  height = 6
+)
+dev.off()
+
+par(mfrow = c(1, 1))
+```
+
+```{r train_jack}
+train_jack <- train %>%
+  transmute(
+    log10price,
+    log_sqft_living = log1p(sqft_living),
+    sqrt_bathrooms = sqrt(bathrooms),
+    log_sqft_basement = log1p(sqft_basement),
+    log_sqft_lot = log1p(sqft_lot)
+  )
+
+X_train <- dplyr::select(
+  train_jack,
+  -log10price
+)
+
+y_train <- train_jack$log10price
+```
+
+```{r test2}
+test_jack <- test2 %>%
+  transmute(
+    log_sqft_living = log1p(sqft_living),
+    sqrt_bathrooms = sqrt(bathrooms),
+    log_sqft_basement = log1p(sqft_basement),
+    log_sqft_lot = log1p(sqft_lot)
+  )
+
+X_test <- test_jack
+
+n <- nrow(X_train)
+m <- nrow(X_test)
+
+jack_preds <- matrix(
+  NA_real_,
+  nrow = n,
+  ncol = m
+)
+
+jack_residuals <- numeric(n)
+
+for (k in seq_len(n)) {
+
+  fit_k <- lm(
+    y ~ .,
+    data = data.frame(
+      y = y_train[-k],
+      X_train[-k, , drop = FALSE]
+    )
+  )
+
+  jack_preds[k, ] <- predict(
+    fit_k,
+    newdata = X_test
+  )
+
+  yhat_k <- predict(
+    fit_k,
+    newdata = X_train[k, , drop = FALSE]
+  )
+
+  jack_residuals[k] <- abs(
+    y_train[k] - yhat_k
+  )
+}
+
+alpha <- 0.05
+
+CI_log10 <- matrix(
+  NA_real_,
+  nrow = m,
+  ncol = 2
+)
+
+# Conservative finite-sample Jackknife+ order-statistic endpoints.
+# alpha/2 targets a 1-alpha coverage lower bound
+# via the standard 1-2*delta guarantee.
+
+lower_rank <- max(
+  1L,
+  floor((n + 1) * alpha / 2)
+)
+
+upper_rank <- min(
+  n,
+  ceiling((n + 1) * (1 - alpha / 2))
+)
+
+for (j in seq_len(m)) {
+
+  lower_candidates <- jack_preds[, j] - jack_residuals
+  upper_candidates <- jack_preds[, j] + jack_residuals
+
+  CI_log10[j, ] <- c(
+    sort(lower_candidates)[lower_rank],
+    sort(upper_candidates)[upper_rank]
+  )
+}
+
+CI_price <- 10^CI_log10
+
+colnames(CI_price) <- c(
+  "lower",
+  "upper"
+)
+
+stopifnot(
+  nrow(CI_price) == nrow(test2),
+  all(CI_price[, 1] <= CI_price[, 2])
+)
+
+head(CI_price)
+
+interval_width <- CI_price[, "upper"] -
+  CI_price[, "lower"]
+
+summary(interval_width)
+```
+
+## 4. Guess Justification
+
+```{r guess}
+guessed_test_mse <- 0.02
+nominal_target_coverage <- 0.95
+
+c(
+  guessed_test_mse = guessed_test_mse,
+  nominal_target_coverage = nominal_target_coverage
+)
+```
+
+## 5. Submission
+
+```{r submission-checks}
+dim(test2)
+dim(CI_price)
+
+length(c(0, 1, 2, 5))
+
+length(c(
+  guessed_test_mse,
+  nominal_target_coverage
+))
+```
